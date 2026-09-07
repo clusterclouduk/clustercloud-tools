@@ -1,0 +1,4 @@
+# Minimal dependencies for importing the app and running mocked unittest tests.
+# This is not a production dependency lockfile.
+fastapi>=0.115,<1
+requests>=2.32.4,<3
