@@ -6,7 +6,7 @@ import json
 app = FastAPI(
     title="ClusterCloud Infrastructure Tools",
     description="Infrastructure tools for ClusterCloud AI - read-only by default; writes are confirmation-gated",
-    version="1.1.1",
+    version="1.1.2",
 )
 
 app.add_middleware(
@@ -1422,6 +1422,18 @@ def _wait_for_action(action_id, timeout_s: int = 30):
     return "in-progress"
 
 
+def _is_k8s_node(d):
+    """
+    Droplets tagged k8s* are DOKS-managed nodes. DigitalOcean no-ops
+    droplet-backup enables on them, and cluster state is covered by
+    Velero, so backup tooling should skip them.
+    """
+    return any(
+        str(t).startswith("k8s")
+        for t in d.get("tags", [])
+    )
+
+
 @app.post(
     "/digitalocean/droplet/enable-backups",
     operation_id="enable_digitalocean_droplet_backups",
@@ -1475,9 +1487,10 @@ def enable_droplet_backups(droplet: str):
     summary="Enable backups on all DigitalOcean Droplets missing backups",
     description=(
         "Find every DigitalOcean Droplet that does not have backups enabled "
-        "and enable backups on each one. This is a write action and must only "
-        "be used after explicit user confirmation. Waits for each action and "
-        "reports the verified backup state."
+        "and enable backups on each one. Skips DOKS-managed nodes (k8s-tagged) "
+        "- cluster state is covered by Velero. This is a write action and "
+        "must only be used after explicit user confirmation. Waits for each "
+        "action and reports the verified backup state."
     ),
 )
 def enable_missing_backups():
@@ -1491,9 +1504,16 @@ def enable_missing_backups():
         "json"
     ]))
 
+    k8s_skipped = [
+        d["name"] for d in droplets
+        if _is_k8s_node(d)
+        and "backups" not in d.get("features", [])
+    ]
+
     missing = [
         d for d in droplets
         if "backups" not in d.get("features", [])
+        and not _is_k8s_node(d)
     ]
 
     results = []
@@ -1530,7 +1550,58 @@ def enable_missing_backups():
 
     return {
         "missing_backups_found": len(missing),
+        "skipped_k8s_nodes": k8s_skipped,
         "results": results
+    }
+
+
+@app.get(
+    "/digitalocean/droplet/backup-policies",
+    operation_id="get_digitalocean_droplet_backup_policies",
+    summary="Get the authoritative backup policy for a DigitalOcean Droplet",
+    description=(
+        "Returns the backup policy for a Droplet by name or ID. The droplet "
+        "'features' backups flag does not reflect DigitalOcean's newer "
+        "backup-policy system (verified live: console-enabled droplets still "
+        "show features backups=false), so use this to confirm whether "
+        "backups are actually enabled and when the next backup runs."
+    ),
+)
+def droplet_backup_policies(droplet: str):
+    d = resolve_droplet(droplet)
+
+    output = run([
+        "doctl",
+        "compute",
+        "droplet",
+        "backup-policies",
+        "get",
+        str(d["id"]),
+        "--output",
+        "json",
+    ])
+
+    try:
+        policies = json.loads(output)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail="doctl returned non-JSON output; backup policy unavailable"
+        )
+
+    if isinstance(policies, dict):
+        policies = policies.get("backup_policies", [policies])
+
+    if not isinstance(policies, list):
+        raise HTTPException(
+            status_code=502,
+            detail="unexpected backup policy response shape; backup policy unavailable"
+        )
+
+    return {
+        "droplet": d["name"],
+        "id": d["id"],
+        "policies": policies,
     }
 
 from datetime import datetime, timezone
