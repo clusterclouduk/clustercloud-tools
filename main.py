@@ -6,7 +6,7 @@ import json
 app = FastAPI(
     title="ClusterCloud Infrastructure Tools",
     description="Infrastructure tools for ClusterCloud AI - read-only by default; writes are confirmation-gated",
-    version="1.1.0",
+    version="1.1.1",
 )
 
 app.add_middleware(
@@ -1363,13 +1363,74 @@ def check_all_droplet_health(minutes: int = 15):
         "servers": results
     }
 
+def _run_doctl_action(cmd):
+    """
+    Run a doctl action command and return the parsed action object.
+
+    Raises if doctl returns anything other than a valid action, so a
+    failed action can never be reported as success. (The previous
+    enable-backups bug: 'doctl compute droplet backup' is not a valid
+    subcommand - doctl printed help text, enabled nothing, and the
+    endpoint still returned success.)
+    """
+    output = run(cmd)
+
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail="doctl returned non-JSON output; action was NOT applied"
+        )
+
+    action = data[0] if isinstance(data, list) and data else data
+
+    if not isinstance(action, dict) or not action.get("id"):
+        raise HTTPException(
+            status_code=502,
+            detail="doctl returned no valid action; action was NOT applied"
+        )
+
+    return action
+
+
+def _wait_for_action(action_id, timeout_s: int = 30):
+    """
+    Poll a DigitalOcean action until it completes.
+
+    Returns the final action status ('completed', 'errored', or
+    'in-progress' if still pending at timeout).
+    """
+    deadline = time.time() + timeout_s
+
+    while time.time() < deadline:
+        action = _run_doctl_action([
+            "doctl",
+            "compute",
+            "action",
+            "get",
+            str(action_id),
+            "--output",
+            "json",
+        ])
+
+        if action.get("status") in ("completed", "errored"):
+            return action.get("status")
+
+        time.sleep(2)
+
+    return "in-progress"
+
+
 @app.post(
     "/digitalocean/droplet/enable-backups",
     operation_id="enable_digitalocean_droplet_backups",
     summary="Enable backups on a DigitalOcean Droplet",
     description=(
         "Enable DigitalOcean backups for a specific Droplet by name or ID. "
-        "This is a write action and should only be called after explicit user confirmation."
+        "This is a write action and should only be called after explicit user "
+        "confirmation. Waits for the action to complete and returns the "
+        "verified backup state."
     ),
 )
 def enable_droplet_backups(droplet: str):
@@ -1383,20 +1444,28 @@ def enable_droplet_backups(droplet: str):
             "status": "backups_already_enabled"
         }
 
-    output = run([
+    action = _run_doctl_action([
         "doctl",
         "compute",
-        "droplet",
-        "backup",
-        str(d["id"])
+        "droplet-action",
+        "enable-backups",
+        str(d["id"]),
+        "--output",
+        "json",
     ])
+
+    action_status = _wait_for_action(action["id"])
+
+    updated = resolve_droplet(d["name"])
 
     return {
         "changed": True,
         "droplet": d["name"],
         "id": d["id"],
         "status": "backup_enable_requested",
-        "result": output
+        "action_id": action["id"],
+        "action_status": action_status,
+        "backups_enabled": "backups" in updated.get("features", []),
     }
 
 
@@ -1407,7 +1476,8 @@ def enable_droplet_backups(droplet: str):
     description=(
         "Find every DigitalOcean Droplet that does not have backups enabled "
         "and enable backups on each one. This is a write action and must only "
-        "be used after explicit user confirmation."
+        "be used after explicit user confirmation. Waits for each action and "
+        "reports the verified backup state."
     ),
 )
 def enable_missing_backups():
@@ -1430,19 +1500,24 @@ def enable_missing_backups():
 
     for d in missing:
         try:
-            output = run([
+            action = _run_doctl_action([
                 "doctl",
                 "compute",
-                "droplet",
-                "backup",
-                str(d["id"])
+                "droplet-action",
+                "enable-backups",
+                str(d["id"]),
+                "--output",
+                "json",
             ])
+
+            action_status = _wait_for_action(action["id"])
 
             results.append({
                 "droplet": d["name"],
                 "id": d["id"],
                 "success": True,
-                "result": output
+                "action_id": action["id"],
+                "action_status": action_status,
             })
 
         except Exception as e:
