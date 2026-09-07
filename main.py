@@ -5,8 +5,8 @@ import json
 
 app = FastAPI(
     title="ClusterCloud Infrastructure Tools",
-    description="Read-only infrastructure tools for ClusterCloud AI",
-    version="1.0.0",
+    description="Infrastructure tools for ClusterCloud AI - read-only by default; writes are confirmation-gated",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -54,26 +54,90 @@ def list_do_clusters():
     ])
     return json.loads(output)
 
+def _droplet_summary(d):
+    features = d.get("features", [])
+    image = d.get("image", {}) or {}
+    dist = image.get("distribution") or ""
+    image_name = image.get("name") or ""
+    version = image_name.split(" ")[0] if image_name[:1].isdigit() else ""
+    networks = d.get("networks", {}).get("v4", [])
+    public_ips = [n.get("ip_address") for n in networks if n.get("type") == "public"]
+
+    return {
+        "id": d.get("id"),
+        "name": d.get("name"),
+        "size": d.get("size_slug"),
+        "vcpus": d.get("vcpus"),
+        "memory_mb": d.get("memory"),
+        "disk_gb": d.get("disk"),
+        "status": d.get("status"),
+        "region": (d.get("region") or {}).get("slug"),
+        "public_ips": public_ips,
+        "os": f"{dist} {version}".strip(),
+        "backups": "backups" in features,
+        "monitoring": "monitoring" in features,
+        "volumes": len(d.get("volume_ids", [])),
+        "created": (d.get("created_at") or "")[:10],
+        "tags": d.get("tags", []),
+        "usd_mo": (d.get("size") or {}).get("price_monthly"),
+    }
+
 @app.get(
     "/digitalocean/droplets",
-    operation_id="list_digitalocean_droplets"
+    operation_id="list_digitalocean_droplets",
+    summary="List DigitalOcean Droplets (compact summary by default)",
+    description=(
+        "List Droplets compactly: name, size, public IPs, OS, backups and "
+        "monitoring flags, volume count, cost, created date. Use as the "
+        "default for fleet questions. detail=true returns the full raw API "
+        "response; droplet=<name or id> narrows to a single Droplet."
+    ),
 )
-def list_droplets():
-    output = run([
+def list_droplets(detail: bool = False, droplet: str = ""):
+    droplets = json.loads(run([
         "doctl",
         "compute",
         "droplet",
         "list",
         "--output",
         "json",
-    ])
-    return json.loads(output)
+    ]))
+
+    if droplet:
+        droplets = [
+            d for d in droplets
+            if str(d.get("id")) == str(droplet)
+            or d.get("name", "").lower() == droplet.lower()
+        ]
+
+        if not droplets:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Droplet '{droplet}' not found"
+            )
+
+    if detail:
+        return {"count": len(droplets), "droplets": droplets}
+
+    return {
+        "count": len(droplets),
+        "droplets": [_droplet_summary(d) for d in droplets]
+    }
 
 # KUBERNETES
 
-@app.get("/kubernetes/nodes", operation_id="get_kubernetes_nodes")
-def nodes():
-    return json.loads(run([
+@app.get(
+    "/kubernetes/nodes",
+    operation_id="get_kubernetes_nodes",
+    summary="List Kubernetes nodes (compact summary by default)",
+    description=(
+        "List cluster nodes compactly: name, ready, memory/disk/PID "
+        "pressure flags, created date. detail=true returns the full raw "
+        "API response."
+    ),
+)
+def nodes(detail: bool = False):
+    raw = json.loads(run([
         "kubectl",
         "get",
         "nodes",
@@ -81,9 +145,41 @@ def nodes():
         "json",
     ]))
 
-@app.get("/kubernetes/namespaces", operation_id="get_kubernetes_namespaces")
-def namespaces():
-    return json.loads(run([
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    out = []
+
+    for node in items:
+        conditions = {
+            c.get("type"): c.get("status")
+            for c in node.get("status", {}).get("conditions", [])
+        }
+
+        out.append({
+            "name": node["metadata"]["name"],
+            "ready": conditions.get("Ready") == "True",
+            "memory_pressure": conditions.get("MemoryPressure") == "True",
+            "disk_pressure": conditions.get("DiskPressure") == "True",
+            "pid_pressure": conditions.get("PIDPressure") == "True",
+            "created": (node["metadata"].get("creationTimestamp") or "")[:10],
+        })
+
+    return {"count": len(out), "nodes": out}
+
+@app.get(
+    "/kubernetes/namespaces",
+    operation_id="get_kubernetes_namespaces",
+    summary="List Kubernetes namespaces (compact summary by default)",
+    description=(
+        "List namespaces compactly: name, status, created date. "
+        "detail=true returns the full raw API response."
+    ),
+)
+def namespaces(detail: bool = False):
+    raw = json.loads(run([
         "kubectl",
         "get",
         "namespaces",
@@ -91,8 +187,34 @@ def namespaces():
         "json",
     ]))
 
-@app.get("/kubernetes/pods", operation_id="get_kubernetes_pods")
-def pods(namespace: str = ""):
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    return {
+        "count": len(items),
+        "namespaces": [
+            {
+                "name": i["metadata"]["name"],
+                "status": i.get("status", {}).get("phase"),
+                "created": (i["metadata"].get("creationTimestamp") or "")[:10],
+            }
+            for i in items
+        ]
+    }
+
+@app.get(
+    "/kubernetes/pods",
+    operation_id="get_kubernetes_pods",
+    summary="List Kubernetes pods (compact summary by default)",
+    description=(
+        "List pods compactly: name, phase, ready, restarts, node, age, "
+        "volume types, resource-requests flag. detail=true returns the "
+        "full raw API response."
+    ),
+)
+def pods(namespace: str = "", detail: bool = False):
     cmd = ["kubectl", "get", "pods"]
 
     if namespace:
@@ -102,10 +224,31 @@ def pods(namespace: str = ""):
 
     cmd += ["-o", "json"]
 
-    return json.loads(run(cmd))
+    raw = json.loads(run(cmd))
 
-@app.get("/kubernetes/events", operation_id="get_kubernetes_events")
-def events(namespace: str = ""):
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    return {
+        "namespace": namespace or "all",
+        "count": len(items),
+        "pods": [_pod_summary(item) for item in items]
+    }
+
+@app.get(
+    "/kubernetes/events",
+    operation_id="get_kubernetes_events",
+    summary="List Kubernetes events (compact, newest first)",
+    description=(
+        "List recent events compactly: type, reason, object, message "
+        "(trimmed), count, last seen. Newest first, capped at 100 by "
+        "default. detail=true returns the full raw API response; limit=N "
+        "changes the cap (max 500)."
+    ),
+)
+def events(namespace: str = "", detail: bool = False, limit: int = 100):
     cmd = ["kubectl", "get", "events"]
 
     if namespace:
@@ -119,7 +262,37 @@ def events(namespace: str = ""):
         "json",
     ]
 
-    return json.loads(run(cmd))
+    raw = json.loads(run(cmd))
+
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    limit = max(1, min(limit, 500))
+
+    # kubectl sorts oldest-first; show newest first
+    recent = list(reversed(items))[:limit]
+
+    return {
+        "namespace": namespace or "all",
+        "total": len(items),
+        "showing": len(recent),
+        "events": [
+            {
+                "type": e.get("type"),
+                "reason": e.get("reason"),
+                "object": "{}/{}".format(
+                    (e.get("involvedObject") or {}).get("kind"),
+                    (e.get("involvedObject") or {}).get("name"),
+                ),
+                "message": (e.get("message") or "")[:160],
+                "count": e.get("count"),
+                "last_seen": e.get("lastTimestamp"),
+            }
+            for e in recent
+        ]
+    }
 
 @app.get(
     "/kubernetes/pod/logs",
@@ -166,9 +339,15 @@ def describe_pod(namespace: str, pod: str):
 
 @app.get(
     "/kubernetes/deployments",
-    operation_id="get_kubernetes_deployments"
+    operation_id="get_kubernetes_deployments",
+    summary="List Kubernetes deployments (compact summary by default)",
+    description=(
+        "List deployments compactly: namespace, name, replicas, ready and "
+        "available counts, created date. detail=true returns the full raw "
+        "API response."
+    ),
 )
-def deployments(namespace: str = ""):
+def deployments(namespace: str = "", detail: bool = False):
     cmd = ["kubectl", "get", "deployments"]
 
     if namespace:
@@ -178,13 +357,40 @@ def deployments(namespace: str = ""):
 
     cmd += ["-o", "json"]
 
-    return json.loads(run(cmd))
+    raw = json.loads(run(cmd))
+
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    return {
+        "namespace": namespace or "all",
+        "count": len(items),
+        "deployments": [
+            {
+                "namespace": i["metadata"]["namespace"],
+                "name": i["metadata"]["name"],
+                "replicas": i.get("spec", {}).get("replicas"),
+                "ready": i.get("status", {}).get("readyReplicas", 0),
+                "available": i.get("status", {}).get("availableReplicas", 0),
+                "created": (i["metadata"].get("creationTimestamp") or "")[:10],
+            }
+            for i in items
+        ]
+    }
 
 @app.get(
     "/kubernetes/services",
-    operation_id="get_kubernetes_services"
+    operation_id="get_kubernetes_services",
+    summary="List Kubernetes services (compact summary by default)",
+    description=(
+        "List services compactly: namespace, name, type, cluster IP, "
+        "external IPs, ports. detail=true returns the full raw API "
+        "response."
+    ),
 )
-def services(namespace: str = ""):
+def services(namespace: str = "", detail: bool = False):
     cmd = ["kubectl", "get", "services"]
 
     if namespace:
@@ -194,13 +400,46 @@ def services(namespace: str = ""):
 
     cmd += ["-o", "json"]
 
-    return json.loads(run(cmd))
+    raw = json.loads(run(cmd))
+
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    def _external_ips(svc):
+        ingress = (svc.get("status", {}).get("loadBalancer") or {}).get("ingress") or []
+        return [e.get("ip") or e.get("hostname") for e in ingress]
+
+    return {
+        "namespace": namespace or "all",
+        "count": len(items),
+        "services": [
+            {
+                "namespace": i["metadata"]["namespace"],
+                "name": i["metadata"]["name"],
+                "type": i.get("spec", {}).get("type"),
+                "cluster_ip": i.get("spec", {}).get("clusterIP"),
+                "external_ips": _external_ips(i),
+                "ports": [
+                    "{}/{}".format(p.get("port"), p.get("protocol", "TCP"))
+                    for p in i.get("spec", {}).get("ports", [])
+                ],
+            }
+            for i in items
+        ]
+    }
 
 @app.get(
     "/kubernetes/ingresses",
-    operation_id="get_kubernetes_ingresses"
+    operation_id="get_kubernetes_ingresses",
+    summary="List Kubernetes ingresses (compact summary by default)",
+    description=(
+        "List ingresses compactly: namespace, name, class, hosts, TLS "
+        "secrets. detail=true returns the full raw API response."
+    ),
 )
-def ingresses(namespace: str = ""):
+def ingresses(namespace: str = "", detail: bool = False):
     cmd = ["kubectl", "get", "ingress"]
 
     if namespace:
@@ -210,13 +449,54 @@ def ingresses(namespace: str = ""):
 
     cmd += ["-o", "json"]
 
-    return json.loads(run(cmd))
+    raw = json.loads(run(cmd))
+
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    def _hosts(ing):
+        hosts = []
+
+        for rule in ing.get("spec", {}).get("rules", []):
+            h = rule.get("host")
+
+            if h and h not in hosts:
+                hosts.append(h)
+
+        return hosts
+
+    return {
+        "namespace": namespace or "all",
+        "count": len(items),
+        "ingresses": [
+            {
+                "namespace": i["metadata"]["namespace"],
+                "name": i["metadata"]["name"],
+                "class": (i.get("spec") or {}).get("ingressClassName"),
+                "hosts": _hosts(i),
+                "tls_secrets": [
+                    t.get("secretName")
+                    for t in (i.get("spec") or {}).get("tls", [])
+                    if t.get("secretName")
+                ],
+            }
+            for i in items
+        ]
+    }
 
 @app.get(
     "/kubernetes/pvcs",
-    operation_id="get_kubernetes_pvcs"
+    operation_id="get_kubernetes_pvcs",
+    summary="List Kubernetes PVCs (compact summary by default)",
+    description=(
+        "List persistent volume claims compactly: namespace, name, status, "
+        "capacity, storage class, bound volume. detail=true returns the "
+        "full raw API response."
+    ),
 )
-def pvcs(namespace: str = ""):
+def pvcs(namespace: str = "", detail: bool = False):
     cmd = ["kubectl", "get", "pvc"]
 
     if namespace:
@@ -226,7 +506,28 @@ def pvcs(namespace: str = ""):
 
     cmd += ["-o", "json"]
 
-    return json.loads(run(cmd))
+    raw = json.loads(run(cmd))
+
+    if detail:
+        return raw
+
+    items = raw.get("items", [])
+
+    return {
+        "namespace": namespace or "all",
+        "count": len(items),
+        "pvcs": [
+            {
+                "namespace": i["metadata"]["namespace"],
+                "name": i["metadata"]["name"],
+                "status": (i.get("status") or {}).get("phase"),
+                "capacity": ((i.get("status") or {}).get("capacity") or {}).get("storage"),
+                "storage_class": (i.get("spec") or {}).get("storageClassName"),
+                "volume": (i.get("spec") or {}).get("volumeName"),
+            }
+            for i in items
+        ]
+    }
 
 @app.get(
     "/kubernetes/workload/logs",
@@ -1181,6 +1482,26 @@ def _pod_age(timestamp):
         return None
 
 
+def _pod_volume_types(spec):
+    types = []
+
+    for v in spec.get("volumes", []):
+        for key, label in [
+            ("emptyDir", "emptyDir"),
+            ("persistentVolumeClaim", "pvc"),
+            ("configMap", "configMap"),
+            ("secret", "secret"),
+            ("hostPath", "hostPath"),
+            ("projected", "projected"),
+        ]:
+            if key in v:
+                if label not in types:
+                    types.append(label)
+                break
+
+    return types
+
+
 def _pod_summary(item):
     metadata = item.get("metadata", {})
     status = item.get("status", {})
@@ -1232,6 +1553,11 @@ def _pod_summary(item):
         "waiting_reasons": waiting_reasons,
         "node": spec.get("nodeName"),
         "age": _pod_age(metadata.get("creationTimestamp")),
+        "volume_types": _pod_volume_types(spec),
+        "resources_set": any(
+            bool((c.get("resources") or {}).get("requests"))
+            for c in spec.get("containers", [])
+        ),
         "healthy": healthy
     }
 
