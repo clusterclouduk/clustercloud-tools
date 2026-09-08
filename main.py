@@ -6,7 +6,7 @@ import json
 app = FastAPI(
     title="ClusterCloud Infrastructure Tools",
     description="Infrastructure tools for ClusterCloud AI - read-only by default; writes are confirmation-gated",
-    version="1.1.2",
+    version="1.1.3",
 )
 
 app.add_middleware(
@@ -120,8 +120,7 @@ def list_droplets(detail: bool = False, droplet: str = ""):
         return {"count": len(droplets), "droplets": droplets}
 
     return {
-        "count": len(droplets),
-        "droplets": [_droplet_summary(d) for d in droplets]
+        "count": len(droplets), "droplets": [_droplet_summary(d) for d in droplets]
     }
 
 # KUBERNETES
@@ -527,6 +526,135 @@ def pvcs(namespace: str = "", detail: bool = False):
             }
             for i in items
         ]
+    }
+
+# ── per-PVC usage via kubelet volume stats ──
+
+def _kubelet_pvc_stats():
+    """{(ns, pvc): {pod, node, used_bytes, capacity_bytes}} from kubelet volume stats."""
+    out = {}
+
+    nodes = json.loads(run([
+        "kubectl",
+        "get",
+        "nodes",
+        "-o",
+        "json",
+    ]))["items"]
+
+    for n in nodes:
+        node = n["metadata"]["name"]
+
+        summary = json.loads(run([
+            "kubectl",
+            "get",
+            "--raw",
+            f"/api/v1/nodes/{node}/proxy/stats/summary",
+        ]))
+
+        for pod in summary.get("pods", []):
+            ref = pod.get("podRef", {})
+
+            for vol in pod.get("volume", []):
+                pvc = vol.get("pvcRef")
+
+                if not pvc:
+                    continue  # emptyDir / configMap / secret / ephemeral-storage
+
+                s = vol.get("stats", {})
+
+                out[(pvc["namespace"], pvc["name"])] = {
+                    "pod": ref.get("name", ""),
+                    "node": node,
+                    "used_bytes": int(s.get("usedBytes") or 0),
+                    "capacity_bytes": int(s.get("capacityBytes") or 0),
+                }
+
+    return out
+
+
+def _to_bytes(size):
+    if not isinstance(size, str):
+        return int(size)
+
+    units = {
+        "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4,
+        "k": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4,
+    }
+
+    for suf, mult in units.items():
+        if size.endswith(suf):
+            return int(float(size[:-len(suf)]) * mult)
+
+    return int(size)
+
+
+@app.get(
+    "/kubernetes/pvc-usage",
+    operation_id="get_kubernetes_pvc_usage",
+    summary="Get per-PVC used space (kubelet volume stats)",
+    description=(
+        "Compact per-PVC disk usage from the kubelet stats-summary API: "
+        "used/capacity/available bytes and used_percent for every PVC-backed "
+        "volume, plus totals, flagging volumes >80% used. Read-only, no pod "
+        "exec, covers database volumes. Use when the user asks how much "
+        "space a PVC or volume is using, or which volumes are nearly full."
+    ),
+)
+def pvc_usage(namespace: str = ""):
+    cmd = ["kubectl", "get", "pvc"]
+
+    if namespace:
+        cmd += ["-n", namespace]
+    else:
+        cmd += ["-A"]
+
+    cmd += ["-o", "json"]
+
+    pvcs = json.loads(run(cmd))["items"]
+    stats = _kubelet_pvc_stats()
+
+    items = []
+    missing = []
+
+    for p in pvcs:
+        ns = p["metadata"]["namespace"]
+        name = p["metadata"]["name"]
+
+        s = stats.get((ns, name))
+
+        cap = _to_bytes(
+            ((p.get("status") or {}).get("capacity") or {}).get("storage") or 0
+        )
+
+        if not s or not s["used_bytes"]:
+            missing.append({"namespace": ns, "name": name})
+            continue
+
+        used = s["used_bytes"]
+        cap = s["capacity_bytes"] or cap
+
+        items.append({
+            "namespace": ns,
+            "name": name,
+            "pod": s["pod"],
+            "node": s["node"],
+            "capacity_bytes": cap,
+            "used_bytes": used,
+            "available_bytes": max(cap - used, 0),
+            "used_percent": round(100 * used / cap, 1) if cap else None,
+            "flag_over_80pct": bool(cap) and used / cap > 0.8,
+        })
+
+    items.sort(key=lambda i: (i["namespace"], i["name"]))
+
+    return {
+        "namespace": namespace or "all",
+        "count": len(items),
+        "total_capacity_bytes": sum(i["capacity_bytes"] for i in items),
+        "total_used_bytes": sum(i["used_bytes"] for i in items),
+        "pvcs": items,
+        "no_stats_available": missing,  # candidates for df-exec fallback
     }
 
 @app.get(
@@ -1776,8 +1904,8 @@ def pod_status_summary(namespace: str = ""):
     description=(
         "Perform a compact read-only health assessment of Kubernetes nodes "
         "and pods. Use this first for broad questions such as 'how is Kubernetes', "
-        "'is the cluster healthy', 'anything wrong with the cluster', or "
-        "'how are my pods looking'."
+        "'is the cluster healthy', 'anything wrong with the cluster', or 'how are "
+        "my pods looking'."
     ),
 )
 def kubernetes_health():
@@ -1935,7 +2063,7 @@ def get_kubernetes_pod_file(
             "-mmin",
             "-" + str(max(1, min(hours, 720)) * 60),
             "-printf",
-            "%TY-%Tm-%Td %TH:%TM %s %p\n",
+            "%TY-%Tm-%Td %TH:%TM %s %p\\n",
         ]
 
     elif action == "grep":
