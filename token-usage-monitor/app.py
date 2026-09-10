@@ -6,16 +6,19 @@ estate and serves a mobile-first dashboard.
 
 Data sources:
   - POST /api/usage and /api/usage/bulk  ingest from any LLM-calling service
-  - Optional Ollama server-log watcher    set OLLAMA_LOG_PATH (best-effort)
+  - Ollama watcher (automatic capture)    set OLLAMA_LOG_UNIT (journal) or
+                                         OLLAMA_LOG_PATH (file), best-effort
   - Manual logging from the dashboard UI
 
 Run:  uvicorn app:app --host 0.0.0.0 --port 8110
-Env:  TUM_DB (sqlite path), TUM_RATES (JSON model rates), OLLAMA_LOG_PATH
+Env:  TUM_DB (sqlite path), TUM_RATES (JSON model rates),
+      OLLAMA_LOG_UNIT (systemd unit journal to tail) or OLLAMA_LOG_PATH (file)
 """
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -40,6 +43,7 @@ except (KeyError, ValueError):
     pass
 
 OLLAMA_LOG = os.environ.get("OLLAMA_LOG_PATH", "").strip()
+OLLAMA_UNIT = os.environ.get("OLLAMA_LOG_UNIT", "").strip()
 
 _db = sqlite3.connect(str(DB_PATH), check_same_thread=False, isolation_level=None)
 _db.row_factory = sqlite3.Row
@@ -115,24 +119,48 @@ def parse_ollama(line):
     return None
 
 
-def _watch_ollama():
+def _ollama_lines():
+    """Yield Ollama log lines from a systemd unit journal (OLLAMA_LOG_UNIT)
+    or a plain log file (OLLAMA_LOG_PATH). File mode re-opens on rotation."""
     while True:
-        try:
-            with open(OLLAMA_LOG, "r", errors="replace") as f:
-                f.seek(0, os.SEEK_END)  # tail from end of file
-                while True:
-                    line = f.readline()
-                    if not line:
+        if OLLAMA_UNIT:
+            p = subprocess.Popen(
+                ["journalctl", "-u", OLLAMA_UNIT, "-f", "-n", "0", "-o", "cat",
+                 "--no-pager"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, errors="replace")
+            try:
+                for line in p.stdout:
+                    yield line
+            finally:
+                p.kill()
+        else:
+            try:
+                with open(OLLAMA_LOG, "r", errors="replace") as f:
+                    f.seek(0, os.SEEK_END)  # tail from end of file
+                    while True:
+                        line = f.readline()
+                        if line:
+                            yield line
+                            continue
                         try:  # reopen if the log was rotated
                             if os.stat(OLLAMA_LOG).st_ino != os.fstat(f.fileno()).st_ino:
                                 break
                         except OSError:
                             pass
                         time.sleep(2)
-                        continue
-                    got = parse_ollama(line)
-                    if got:
-                        insert_event("ollama", got[2], got[0], got[1])
+            except Exception as exc:
+                print(f"[token-usage-monitor] ollama watcher: {exc}", file=sys.stderr)
+                time.sleep(30)
+
+
+def _watch_ollama():
+    while True:
+        try:
+            for line in _ollama_lines():
+                got = parse_ollama(line)
+                if got:
+                    insert_event("ollama", got[2], got[0], got[1])
         except Exception as exc:
             print(f"[token-usage-monitor] ollama watcher: {exc}", file=sys.stderr)
             time.sleep(30)
@@ -231,8 +259,9 @@ def summary(days: int = 7):
 
 @app.get("/api/health")
 def health():
+    mode = ("journal:" + OLLAMA_UNIT) if OLLAMA_UNIT else (OLLAMA_LOG if OLLAMA_LOG else None)
     return {"ok": True, "service": "token-usage-monitor", "db": str(DB_PATH),
-            "ollama_watcher": bool(OLLAMA_LOG)}
+            "ollama_watcher": bool(mode), "watcher_mode": mode}
 
 
 @app.get("/")
@@ -240,5 +269,5 @@ def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
-if OLLAMA_LOG:
+if OLLAMA_LOG or OLLAMA_UNIT:
     threading.Thread(target=_watch_ollama, daemon=True, name="ollama-watch").start()
