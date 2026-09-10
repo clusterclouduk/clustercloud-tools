@@ -6,7 +6,7 @@ import json
 app = FastAPI(
     title="ClusterCloud Infrastructure Tools",
     description="Infrastructure tools for ClusterCloud AI - read-only by default; writes are confirmation-gated",
-    version="1.1.3",
+    version="1.1.4",
 )
 
 app.add_middleware(
@@ -531,7 +531,7 @@ def pvcs(namespace: str = "", detail: bool = False):
 # ── per-PVC usage via kubelet volume stats ──
 
 def _kubelet_pvc_stats():
-    """{(ns, pvc): {pod, node, used_bytes, capacity_bytes}} from kubelet volume stats."""
+    """{(ns, pvc): {pod, node, used_bytes, capacity_bytes, stats_available}} from kubelet volume stats."""
     out = {}
 
     nodes = json.loads(run([
@@ -561,13 +561,26 @@ def _kubelet_pvc_stats():
                 if not pvc:
                     continue  # emptyDir / configMap / secret / ephemeral-storage
 
-                s = vol.get("stats", {})
+                # The kubelet Summary API puts volume stats fields FLAT on
+                # the volume object (vol.usedBytes / vol.capacityBytes /
+                # vol.availableBytes) - there is no nested "stats" key.
+                # The previous code read vol.get("stats", {}) which is
+                # always empty, so every PVC in the cluster landed in
+                # no_stats_available. Read the flat fields first; keep the
+                # nested form as a fallback for other/future formats.
+                s = vol.get("stats") or vol
+
+                used = s.get("usedBytes")
+                capacity = s.get("capacityBytes")
 
                 out[(pvc["namespace"], pvc["name"])] = {
                     "pod": ref.get("name", ""),
                     "node": node,
-                    "used_bytes": int(s.get("usedBytes") or 0),
-                    "capacity_bytes": int(s.get("capacityBytes") or 0),
+                    "used_bytes": int(used) if used is not None else 0,
+                    "capacity_bytes": int(capacity) if capacity is not None else 0,
+                    # kubelet omits stat fields when unavailable:
+                    # distinguish "reported null" from "genuinely zero used"
+                    "stats_available": used is not None,
                 }
 
     return out
@@ -627,7 +640,9 @@ def pvc_usage(namespace: str = ""):
             ((p.get("status") or {}).get("capacity") or {}).get("storage") or 0
         )
 
-        if not s or not s["used_bytes"]:
+        # Only genuinely-unavailable stats land in missing; a fresh volume
+        # reporting usedBytes=0 is a valid result, not a gap.
+        if s is None or not s["stats_available"]:
             missing.append({"namespace": ns, "name": name})
             continue
 
@@ -920,9 +935,8 @@ def droplet_metrics(
             "available_bytes": mem_available["value"],
             "used_bytes": used,
             "used_percent": round(
-                (used / mem_total["value"]) * 100,
-                2
-            )
+                (used / mem_total["value"]) * 100
+            ), 2)
         }
 
     # Filesystem endpoints may return multiple devices/mounts,
