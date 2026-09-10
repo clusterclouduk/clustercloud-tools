@@ -177,38 +177,57 @@ def _ollama_lines():
 
 
 def _watch_ollama():
-    """Stateful watcher: legacy one-line counts, or Ollama 0.33+ split timing lines."""
+    """Stateful watcher: legacy one-line counts, or Ollama 0.33+ split timing lines.
+
+    On warm requests, llama.cpp prints timing *before* Ollama logs runner.name,
+    so we hold a completed (prompt, eval) pair until the model name arrives
+    (or the next request starts).
+    """
     while True:
         try:
             current_model = "ollama"
             pending_prompt = None
-            for line in _ollama_lines():
-                for rx in _RX_MODEL:
-                    mm = rx.search(line)
-                    if mm:
-                        current_model = _short_model(mm.group(1))
-                        break
+            pending_event = None  # (input_tokens, output_tokens)
 
+            def flush(model=None):
+                nonlocal pending_event
+                if pending_event is None:
+                    return
+                tin, tout = pending_event
+                pending_event = None
+                insert_event("ollama", model or current_model, tin, tout)
+
+            for line in _ollama_lines():
                 got = parse_ollama(line)
                 if got:
+                    flush()
                     insert_event("ollama", got[2], got[0], got[1])
                     pending_prompt = None
                     continue
 
                 mp = _RX_PROMPT_TOKENS.search(line)
                 if mp:
+                    flush()  # previous request never got a model line
                     pending_prompt = int(mp.group(1))
                     continue
 
                 me = _RX_EVAL_TOKENS.search(line)
                 if me and pending_prompt is not None:
-                    insert_event(
-                        "ollama",
-                        current_model,
-                        pending_prompt,
-                        int(me.group(1)),
-                    )
+                    pending_event = (pending_prompt, int(me.group(1)))
                     pending_prompt = None
+                    continue
+
+                for rx in _RX_MODEL:
+                    mm = rx.search(line)
+                    if not mm:
+                        continue
+                    name = _short_model(mm.group(1))
+                    if name == "ollama":
+                        break
+                    current_model = name
+                    if pending_event is not None:
+                        flush(current_model)
+                    break
         except Exception as exc:
             print(f"[token-usage-monitor] ollama watcher: {exc}", file=sys.stderr)
             time.sleep(30)
