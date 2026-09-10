@@ -935,8 +935,9 @@ def droplet_metrics(
             "available_bytes": mem_available["value"],
             "used_bytes": used,
             "used_percent": round(
-                (used / mem_total["value"]) * 100
-            ), 2)
+                (used / mem_total["value"]) * 100,
+                2
+            )
         }
 
     # Filesystem endpoints may return multiple devices/mounts,
