@@ -5,6 +5,9 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/clustercloud-tools/token-usage-monitor
+# Automatic Ollama capture — enable ONE of the two:
+#Environment=OLLAMA_LOG_UNIT=ollama
+#Environment=OLLAMA_LOG_PATH=/var/log/ollama.log
 ExecStart=/opt/clustercloud-tools/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8110
 Restart=always
 RestartSec=5
