@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0f14">
+<title>Token Usage Monitor</title>
+<style>
+:root{--bg:#0b0f14;--card:#141b24;--line:#223042;--txt:#e6edf3;--dim:#8b98a5;--acc:#4da3ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);padding:16px;max-width:640px;margin:0 auto}
+h1{font-size:1.1rem;margin-bottom:2px}
+.sub{color:var(--dim);font-size:.8rem;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+.big{font-size:2rem;font-weight:700}
+.row{display:flex;justify-content:space-between;gap:8px;font-size:.85rem;color:var(--dim);margin-top:6px}
+.bar{height:10px;background:#0d1117;border-radius:6px;overflow:hidden;margin-top:10px}
+.bar>div{height:100%;background:#3ddc84;transition:width .4s}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+td,th{padding:6px 4px;text-align:left;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+canvas{width:100%;height:140px;display:block}
+input,button{background:#0d1117;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:8px;font-size:.85rem;width:100%}
+form{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{background:var(--acc);color:#04121f;border:none;font-weight:600}
+.full{grid-column:1/-1}
+.label{font-size:.8rem;color:var(--dim);margin:12px 0 8px}
+.err{display:none;background:#3a1414;border:1px solid #ff6b6b;color:#ff6b6b;padding:8px;border-radius:8px;font-size:.8rem;margin-bottom:12px}
+</style>
+</head>
+<body>
+<h1>&#9889; Token Usage Monitor</h1>
+<div class="sub">ClusterCloud AI estate &middot; auto-refresh 60s</div>
+<div class="err" id="err"></div>
+<div class="card">
+  <div class="row"><span>Today</span><span id="todayCost"></span></div>
+  <div class="big" id="todayTokens">&ndash;</div>
+  <div class="bar"><div id="budgetBar" style="width:0%"></div></div>
+  <div class="row"><span id="budgetTxt"></span><span id="todaySplit"></span></div>
+</div>
+<div class="card">
+  <canvas id="chart"></canvas>
+  <div class="row"><span><span style="color:#4da3ff">&#9632;</span> in &middot; <span style="color:#3ddc84">&#9632;</span> out</span><span id="winTxt"></span></div>
+</div>
+<div class="card">
+  <div class="label">By source</div><table id="srcT"></table>
+  <div class="label">By model</div><table id="mdlT"></table>
+</div>
+<div class="card">
+  <div class="label">Log usage manually</div>
+  <form id="logF">
+    <input id="f_src" placeholder="source e.g. chat" required>
+    <input id="f_model" placeholder="model" value="unknown">
+    <input id="f_in" type="number" placeholder="input tokens" required>
+    <input id="f_out" type="number" placeholder="output tokens" value="0">
+    <button class="full" type="submit">Add</button>
+  </form>
+  <div class="label">Daily budget (tokens)</div>
+  <form id="budF">
+    <input id="f_budget" type="number" placeholder="500000">
+    <button type="submit">Set</button>
+  </form>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+const fmt=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n);
+async function load(){
+  try{
+    const s=await(await fetch('/api/summary?days=7')).json();
+    const tin=s.today.input_tokens||0,tout=s.today.output_tokens||0;
+    $('todayTokens').textContent=fmt(tin+tout);
+    $('todayCost').textContent='$'+(s.today.cost_usd||0).toFixed(2);
+    $('todaySplit').textContent='in '+fmt(tin)+' \u00b7 out '+fmt(tout);
+    const b=s.budget,bar=$('budgetBar');
+    bar.style.width=Math.min(b.used_pct,100)+'%';
+    bar.style.background=b.used_pct>=100?'#ff6b6b':b.used_pct>=b.alert_pct?'#ffb347':'#3ddc84';
+    $('budgetTxt').textContent=b.used_pct+'% of '+fmt(b.daily_tokens)+' daily budget';
+    $('winTxt').textContent='7 days: '+fmt(s.window.input_tokens+s.window.output_tokens)+' \u00b7 $'+(s.window.cost_usd||0).toFixed(2);
+    draw(s.days);tables(s);
+    $('err').style.display='none';
+  }catch(e){$('err').textContent='Cannot reach API: '+e;$('err').style.display='block';}
+}
+function draw(days){
+  const c=$('chart'),d=c.getContext('2d');
+  const w=c.width=c.clientWidth*2,h=c.height=280,bottom=h-34;
+  d.clearRect(0,0,w,h);
+  const max=Math.max(1,...days.map(x=>x.input_tokens+x.output_tokens));
+  const bw=w/days.length;
+  days.forEach((x,i)=>{
+    const inH=x.input_tokens/max*(bottom-10),outH=x.output_tokens/max*(bottom-10),px=i*bw+bw*0.2;
+    if(x.input_tokens){d.fillStyle='#4da3ff';d.fillRect(px,bottom-inH-outH,bw*0.6,inH);}
+    if(x.output_tokens){d.fillStyle='#3ddc84';d.fillRect(px,bottom-outH,bw*0.6,outH);}
+    d.fillStyle='#8b98a5';d.font='18px sans-serif';d.textAlign='center';
+    d.fillText(x.date.slice(5),i*bw+bw/2,h-10);
+  });
+}
+function tables(s){
+  const mk=(rows,key)=>'<tr><th>'+key+'</th><th class="num">in</th><th class="num">out</th><th class="num">$</th></tr>'+
+    (rows.length?rows.map(r=>'<tr><td>'+esc(r[key])+'</td><td class="num">'+fmt(r.input_tokens)+'</td><td class="num">'+fmt(r.output_tokens)+'</td><td class="num">'+(r.cost_usd||0).toFixed(2)+'</td></tr>').join(''):'<tr><td colspan="4">no data yet</td></tr>');
+  $('srcT').innerHTML=mk(s.by_source,'source');
+  $('mdlT').innerHTML=mk(s.by_model,'model');
+}
+$('logF').onsubmit=async e=>{
+  e.preventDefault();
+  await fetch('/api/usage',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({source:$('f_src').value,model:$('f_model').value,
+      input_tokens:+$('f_in').value,output_tokens:+$('f_out').value})});
+  $('f_in').value='';load();
+};
+$('budF').onsubmit=async e=>{
+  e.preventDefault();
+  await fetch('/api/budget',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({daily_tokens:+$('f_budget').value||500000,alert_pct:80})});
+  load();
+};
+load();setInterval(load,60000);
+</script>
+</body>
+</html>
