@@ -29,42 +29,35 @@ Notes:
 - `cost_usd` optional — otherwise estimated from `TUM_RATES` (USD per 1M tokens, JSON env var, substring-matched on model name; defaults cover sonnet/opus/haiku/gpt-4o/gpt-4).
 - `ts` optional ISO-8601, defaults to now (UTC).
 
-## Automatic capture: Ollama watcher
+## Automatic capture
 
-All platform chats run Open WebUI → Ollama on this VM, so tailing Ollama captures
-every token the platform spends (every user, every model) — no manual logging needed.
+### Cloud + local models (recommended): Ollama usage proxy
 
-Enable Ollama's per-request token counts (debug logging), then point the watcher at
-its journal:
+Cloud models (`*:cloud`) never write token counts to the journal — counts only
+appear in the HTTP response. The usage proxy sits on `:11434` (where Open WebUI
+already points) and forwards to Ollama on `127.0.0.1:11435`, POSTing each
+chat/generate's `prompt_eval_count` / `eval_count` to this monitor.
 
-    # 1) ollama token counts (one-time)
+    # Ollama listens internally
     sudo systemctl edit ollama
         [Service]
+        Environment=OLLAMA_HOST=127.0.0.1:11435
         Environment=OLLAMA_DEBUG=1
-    sudo systemctl restart ollama      # between chats — kills in-flight generation
 
-    # 2) watcher
-    sudo systemctl edit token-usage-monitor
-        [Service]
-        Environment=OLLAMA_LOG_UNIT=ollama
-    sudo systemctl restart token-usage-monitor
+    sudo cp token-usage-monitor/ollama-usage-proxy.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl restart ollama
+    sudo systemctl enable --now ollama-usage-proxy
 
-Alternative modes (set exactly one):
-- `OLLAMA_LOG_UNIT=ollama` — tail a systemd unit's journal (recommended, above)
-- `OLLAMA_LOG_PATH=/path` — tail a plain log file (e.g. a Docker json-file log)
+Verify: `curl -s localhost:8110/api/health` and a cloud chat should add rows
+under source `ollama` (model name from the response).
 
-Verify: `curl -s localhost:8110/api/health` → `watcher_mode: "journal:ollama"`, then
-send any chat message and refresh the dashboard — rows appear under source `ollama`.
+### Legacy: journal watcher (local models only)
 
-Notes:
-- Capture starts when the watcher starts — nothing retroactive.
-- `journalctl -u ollama -n 30 | grep eval_count` after a chat message confirms Ollama
-  is emitting counts (needed once, after enabling OLLAMA_DEBUG).
-- If your model is cloud-routed via Ollama and never emits eval_count, open an issue —
-  fallback is middleware ingest or the manual form.
+Set `OLLAMA_LOG_UNIT=ollama` on `token-usage-monitor` to also tail journal
+timing lines. Useful as a backup for local models; **not sufficient for cloud**.
 
 ## Wiring other sources
 
-Anything else that calls LLMs POSTs to `/api/usage`. The chat platform exposes no
-usage API to the assistant, so the Ollama watcher above is the automated path for
-platform chats; the manual form remains for anything off-platform.
+Anything else that calls LLMs POSTs to `/api/usage`. The manual dashboard form
+remains for off-platform usage.
