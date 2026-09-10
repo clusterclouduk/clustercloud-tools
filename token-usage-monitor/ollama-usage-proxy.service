@@ -1,0 +1,17 @@
+[Unit]
+Description=ClusterCloud Ollama Usage Proxy (captures cloud + local token counts)
+After=network.target ollama.service token-usage-monitor.service
+Wants=ollama.service token-usage-monitor.service
+
+[Service]
+Type=simple
+User=clustercloud
+WorkingDirectory=/opt/clustercloud-tools/token-usage-monitor
+Environment=OLLAMA_UPSTREAM=http://127.0.0.1:11435
+Environment=TUM_USAGE_URL=http://127.0.0.1:8110/api/usage
+ExecStart=/opt/clustercloud-tools/venv/bin/uvicorn ollama_proxy:app --host 0.0.0.0 --port 11434
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
