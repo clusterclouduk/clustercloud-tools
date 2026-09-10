@@ -105,17 +105,39 @@ def insert_event(source, model, tin, tout, ts=None, cost=None, note=None):
 
 
 # ---------------------------------------------------------------- ollama watcher
+# Legacy formats (older Ollama): both counts on one line.
 _RX_COUNTS = (re.compile(r'"prompt_eval_count"\s*:\s*(\d+).*?"eval_count"\s*:\s*(\d+)'),
               re.compile(r"prompt_eval_count=(\d+).*?\beval_count=(\d+)"))
-_RX_MODEL = (re.compile(r'"model"\s*:\s*"([^"]+)"'), re.compile(r'\bmodel=([^\s,"]+)'))
+# Ollama 0.33+ / llama.cpp DEBUG timing (separate lines):
+#   prompt eval time = 142.07 ms / 11 tokens
+#   eval time = 154.84 ms / 5 tokens
+_RX_PROMPT_TOKENS = re.compile(r"prompt eval time\s*=\s*[\d.]+\s*ms\s*/\s*(\d+)\s*tokens")
+_RX_EVAL_TOKENS = re.compile(r"(?<!prompt )\beval time\s*=\s*[\d.]+\s*ms\s*/\s*(\d+)\s*tokens")
+_RX_MODEL = (
+    re.compile(r'"model"\s*:\s*"([^"]+)"'),
+    re.compile(r"\brunner\.name=([^\s,\"']+)"),
+    # Avoid matching runner.model=/path/blobs/sha256-...
+    re.compile(r"(?<![.\w])model=([^\s,\"'/]+)"),
+)
+
+
+def _short_model(name: str) -> str:
+    # registry.ollama.ai/library/qwen3:1.7b → qwen3:1.7b
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    if name.startswith("sha256-") or name.startswith("sha256:"):
+        return "ollama"
+    return name or "ollama"
 
 
 def parse_ollama(line):
+    """Return (input_tokens, output_tokens, model) or None (legacy one-line forms)."""
     for rx in _RX_COUNTS:
         m = rx.search(line)
         if m:
-            mm = _RX_MODEL[0].search(line) or _RX_MODEL[1].search(line)
-            return int(m.group(1)), int(m.group(2)), (mm.group(1) if mm else "ollama")
+            mm = next((r.search(line) for r in _RX_MODEL if r.search(line)), None)
+            model = _short_model(mm.group(1)) if mm else "ollama"
+            return int(m.group(1)), int(m.group(2)), model
     return None
 
 
@@ -155,12 +177,38 @@ def _ollama_lines():
 
 
 def _watch_ollama():
+    """Stateful watcher: legacy one-line counts, or Ollama 0.33+ split timing lines."""
     while True:
         try:
+            current_model = "ollama"
+            pending_prompt = None
             for line in _ollama_lines():
+                for rx in _RX_MODEL:
+                    mm = rx.search(line)
+                    if mm:
+                        current_model = _short_model(mm.group(1))
+                        break
+
                 got = parse_ollama(line)
                 if got:
                     insert_event("ollama", got[2], got[0], got[1])
+                    pending_prompt = None
+                    continue
+
+                mp = _RX_PROMPT_TOKENS.search(line)
+                if mp:
+                    pending_prompt = int(mp.group(1))
+                    continue
+
+                me = _RX_EVAL_TOKENS.search(line)
+                if me and pending_prompt is not None:
+                    insert_event(
+                        "ollama",
+                        current_model,
+                        pending_prompt,
+                        int(me.group(1)),
+                    )
+                    pending_prompt = None
         except Exception as exc:
             print(f"[token-usage-monitor] ollama watcher: {exc}", file=sys.stderr)
             time.sleep(30)
