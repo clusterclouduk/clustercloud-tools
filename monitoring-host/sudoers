@@ -1,0 +1,3 @@
+# Install as root:root 0440 /etc/sudoers.d/clustercloud-monitoring; validate with visudo -cf.
+# No wildcards, shells, arbitrary arguments, package managers or generic systemctl access.
+clusterai ALL=(root) NOPASSWD: /usr/local/sbin/clustercloud-monitoring-helper status, /usr/local/sbin/clustercloud-monitoring-helper logs, /usr/local/sbin/clustercloud-monitoring-helper probe, /usr/local/sbin/clustercloud-monitoring-helper install, /usr/local/sbin/clustercloud-monitoring-helper start, /usr/local/sbin/clustercloud-monitoring-helper restart
